@@ -1,4 +1,4 @@
-"""Monte Carlo Portfolio Simulator with a no-lookahead historical backtest.
+"""Monte Carlo Portfolio Simulator with historical and rolling backtests.
 
 Place this file alongside simulation.py and requirements.txt in your GitHub repo.
 Run locally with: streamlit run app.py
@@ -15,14 +15,15 @@ from simulation import (
     load_backtest_prices,
     load_market_data,
     run_historical_backtest,
+    run_rolling_backtest,
     run_simulation,
 )
 
 st.set_page_config(page_title="Monte Carlo Portfolio Simulator", page_icon="📈", layout="wide")
 st.title("Monte Carlo Portfolio Simulator")
 st.write(
-    "Explore portfolio risk with simulations and check a past forecast "
-    "against what actually happened."
+    "Explore portfolio risk with simulations, test a past forecast, "
+    "and evaluate forecasts across many historical periods."
 )
 
 
@@ -96,8 +97,9 @@ weights = [w / sum(weights_percent) for w in weights_percent]
 
 # The tabs track which one is open, so Streamlit only downloads and simulates
 # data for the tab the user is viewing. This avoids unnecessary API requests.
-forecast_tab, backtest_tab = st.tabs(
-    ["📈 Monte Carlo Forecast", "🧪 Historical Backtest"], on_change="rerun"
+forecast_tab, backtest_tab, rolling_tab = st.tabs(
+    ["📈 Monte Carlo Forecast", "🧪 Historical Backtest", "🔁 Rolling Backtest"],
+    on_change="rerun",
 )
 
 if forecast_tab.open:
@@ -318,6 +320,186 @@ if backtest_tab.open:
                     comparison_csv,
                     file_name="monte_carlo_backtest.csv",
                     mime="text/csv",
+                )
+
+
+if rolling_tab.open:
+    with rolling_tab:
+        st.subheader("Rolling out-of-sample backtest")
+        st.write(
+            "Instead of testing just one cutoff date, this repeats your historical "
+            "forecast at multiple dates. Each window fits its return and covariance "
+            "estimates using past data only, then compares the simulated end-value "
+            "range with the following real market performance."
+        )
+
+        default_last = date.today() - timedelta(days=420)
+        default_first = default_last - timedelta(days=365 * 3)
+        r1, r2 = st.columns(2)
+        with r1:
+            rolling_first = st.date_input(
+                "First historical cutoff",
+                value=default_first,
+                min_value=date(2000, 1, 1),
+                max_value=date.today() - timedelta(days=2),
+                key="rolling_first_cutoff",
+                help="The earliest historical date to generate a forecast from.",
+            )
+        with r2:
+            rolling_last = st.date_input(
+                "Last historical cutoff",
+                value=default_last,
+                min_value=date(2000, 1, 1),
+                max_value=date.today() - timedelta(days=1),
+                key="rolling_last_cutoff",
+                help="The latest historical date to generate a forecast from. "
+                "Later dates might not have a completed test period yet.",
+            )
+        r3, r4, r5 = st.columns(3)
+        with r3:
+            rolling_horizon = st.selectbox(
+                "Horizon per test",
+                [63, 126, 252],
+                index=2,
+                format_func=lambda v: {63:"~3 months", 126:"~6 months", 252:"~1 year"}[v],
+                key="rolling_horizon",
+            )
+        with r4:
+            rolling_step = st.selectbox(
+                "New forecast every",
+                [21, 63, 126, 252],
+                index=1,
+                format_func=lambda v: {21:"~1 month", 63:"~3 months", 126:"~6 months", 252:"~1 year"}[v],
+                key="rolling_step",
+            )
+        with r5:
+            rolling_simulations = st.selectbox(
+                "Simulations per test",
+                [200, 500, 1000],
+                index=1,
+                key="rolling_simulations",
+                help="More simulations smooth the percentile estimates but take longer.",
+            )
+
+        if not rolling_first or not rolling_last or rolling_first >= rolling_last:
+            st.warning("Choose a first cutoff date earlier than the last cutoff date.")
+        else:
+            try:
+                with st.spinner("Re-estimating the model across historical windows..."):
+                    # The earliest cutoff determines how far back to download.
+                    # The returned prices extend through the present, allowing
+                    # evaluation of every completed future window.
+                    rolling_prices = cached_backtest_prices(
+                        tuple(tickers), rolling_first, history_years
+                    )
+                    rolling = run_rolling_backtest(
+                        prices=rolling_prices,
+                        first_cutoff_date=rolling_first,
+                        last_cutoff_date=rolling_last,
+                        lookback_years=history_years,
+                        weights=weights,
+                        initial_portfolio=investment,
+                        num_simulations=rolling_simulations,
+                        horizon_days=rolling_horizon,
+                        step_sessions=rolling_step,
+                        risk_free_rate=risk_free_percent / 100,
+                        seed=42,
+                    )
+            except (ValueError, KeyError, OSError, RuntimeError) as exc:
+                st.error(f"Could not complete rolling backtest: {exc}")
+            else:
+                windows = rolling["windows"]
+                n_completed = rolling["completed_windows"]
+                st.caption(
+                    f"{n_completed} completed forecasts · "
+                    f"{rolling['candidate_windows']} sampled cutoffs · "
+                    f"{rolling_simulations:,} simulations per forecast · "
+                    f"{rolling_horizon} trading days per test · "
+                    f"{history_years} years of historical calibration per cutoff"
+                )
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("90% interval coverage", f"{rolling['coverage_rate']:.1%}")
+                m2.metric("Below 5th percentile", f"{rolling['below_rate']:.1%}")
+                m3.metric("Above 95th percentile", f"{rolling['above_rate']:.1%}")
+                m4.metric(
+                    "Median absolute return error",
+                    f"{rolling['median_absolute_return_error_pct_points']:.1f} pp",
+                    help="Median of absolute differences between realized and forecast-median total returns, measured in percentage points.",
+                )
+
+                if len(rolling["skipped"]):
+                    st.warning(
+                        f"{len(rolling['skipped'])} windows were skipped because of "
+                        "insufficient training history or incomplete actual test periods. "
+                        "Only completed windows count toward the summary."
+                    )
+                    with st.expander("Show skipped cutoff dates"):
+                        st.dataframe(rolling["skipped"], hide_index=True, use_container_width=True)
+
+                st.subheader("Forecast interval vs. actual ending values")
+                st.caption(
+                    "Each dot/interval is a separate forecast starting from the "
+                    f"same ${investment:,.0f} initial portfolio. Dates on the horizontal "
+                    "axis are the **test end dates**, not a continuous portfolio track."
+                )
+                x = pd.DatetimeIndex(windows["test_end"])
+                lower = windows["predicted_p05"].to_numpy(dtype=float)
+                upper = windows["predicted_p95"].to_numpy(dtype=float)
+                medians = windows["predicted_median"].to_numpy(dtype=float)
+                actuals = windows["actual_ending_value"].to_numpy(dtype=float)
+                covered = windows["inside_90_interval"].to_numpy(dtype=bool)
+                fig, ax = plt.subplots(figsize=(11, 5))
+                ax.fill_between(x, lower, upper, alpha=0.20, label="Predicted 5th–95th range")
+                ax.plot(x, medians, linewidth=1.8, label="Predicted median")
+                ax.scatter(x[covered], actuals[covered], s=35, label="Actual: inside range", zorder=4)
+                if (~covered).any():
+                    ax.scatter(
+                        x[~covered], actuals[~covered], marker="x", s=70,
+                        label="Actual: outside range", zorder=5,
+                    )
+                ax.axhline(investment, linestyle="--", alpha=0.35, label="Initial investment")
+                ax.set(xlabel="Test end date", ylabel="Portfolio ending value ($)")
+                ax.grid(alpha=0.20)
+                ax.legend(fontsize="small")
+                fig.autofmt_xdate()
+                st.pyplot(fig, clear_figure=True)
+                plt.close(fig)
+
+                st.subheader("Results by historical cutoff")
+                table = windows[[
+                    "cutoff_date", "test_end", "actual_ending_value",
+                    "predicted_p05", "predicted_median", "predicted_p95",
+                    "actual_total_return", "predicted_median_return", "outcome",
+                ]].copy()
+                table.columns = [
+                    "Cutoff date", "Test end", "Actual ending ($)",
+                    "Forecast 5th ($)", "Forecast median ($)", "Forecast 95th ($)",
+                    "Actual return", "Forecast median return", "Outcome",
+                ]
+                st.dataframe(
+                    table.style.format({
+                        "Cutoff date": "{:%Y-%m-%d}", "Test end": "{:%Y-%m-%d}",
+                        "Actual ending ($)": "${:,.0f}", "Forecast 5th ($)": "${:,.0f}",
+                        "Forecast median ($)": "${:,.0f}", "Forecast 95th ($)": "${:,.0f}",
+                        "Actual return": "{:+.1%}", "Forecast median return": "{:+.1%}",
+                    }),
+                    use_container_width=True, hide_index=True,
+                )
+                csv_data = windows.copy()
+                for col in ["cutoff_date", "training_start", "training_end", "test_start", "test_end"]:
+                    csv_data[col] = pd.to_datetime(csv_data[col]).dt.strftime("%Y-%m-%d")
+                st.download_button(
+                    "Download rolling backtest results (CSV)",
+                    csv_data.to_csv(index=False),
+                    file_name="monte_carlo_rolling_backtest.csv",
+                    mime="text/csv",
+                )
+                st.info(
+                    "A 5th–95th percentile end-value interval targets **90% coverage** "
+                    "under the model's assumptions—not a guarantee. A dozen backtests "
+                    "is a small sample, and overlapping test periods share much of "
+                    "the same market history, so their results are correlated. "
+                    "Coverage alone is not enough to prove the model is calibrated."
                 )
 
 st.caption(

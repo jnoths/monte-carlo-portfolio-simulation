@@ -266,3 +266,125 @@ def run_historical_backtest(
         "inside_90_percent_interval": bool(p5 <= actual_end <= p95),
         "actual_percentile_of_simulations": float(np.mean(final_distribution <= actual_end)),
     }
+
+
+def run_rolling_backtest(
+    prices: pd.DataFrame,
+    first_cutoff_date: date,
+    last_cutoff_date: date,
+    lookback_years: int,
+    weights: list[float],
+    initial_portfolio: float = 10_000,
+    num_simulations: int = 500,
+    horizon_days: int = 252,
+    step_sessions: int = 63,
+    risk_free_rate: float = 0.04,
+    seed: int = 42,
+    max_windows: int = 30,
+) -> dict:
+    """Repeat the original no-lookahead backtest at multiple past cutoffs.
+
+    Candidate cutoffs are every `step_sessions` actual trading sessions within
+    the inclusive requested date range, using only common observations for all
+    tickers. Each forecast re-estimates its model using ONLY prices before
+    its cutoff. Outcomes are measured after that cutoff. Incomplete test
+    windows are skipped, never scored as successful or unsuccessful.
+
+    Returns a DataFrame of completed tests and aggregate end-value metrics.
+    Tests may overlap, so coverage observations are generally not independent.
+    """
+    if not isinstance(prices, pd.DataFrame) or prices.empty:
+        raise ValueError("No price history available for rolling backtest.")
+    if step_sessions < 1:
+        raise ValueError("Spacing between cutoffs must be at least one trading session.")
+    if horizon_days < 1 or num_simulations < 1 or max_windows < 1:
+        raise ValueError("Horizon, simulations, and maximum windows must be positive.")
+    if lookback_years < 1:
+        raise ValueError("Historical lookback must be at least one year.")
+
+    first = pd.Timestamp(first_cutoff_date).normalize()
+    last = pd.Timestamp(last_cutoff_date).normalize()
+    if first >= last:
+        raise ValueError("The first cutoff must be earlier than the last cutoff.")
+    if last >= pd.Timestamp(date.today()):
+        raise ValueError("The last cutoff must be in the past.")
+
+    # All eligible calendar dates are mapped to actual observed trading days.
+    # No training or test data are constructed by forward-filling missing dates.
+    all_cutoffs = prices.index[(prices.index >= first) & (prices.index <= last)]
+    cutoffs = all_cutoffs[::step_sessions]
+    if len(cutoffs) > max_windows:
+        raise ValueError(
+            f"That setting creates {len(cutoffs)} windows; the dashboard allows "
+            f"up to {max_windows}. Use wider cutoff spacing or a shorter date range."
+        )
+    if not len(cutoffs):
+        raise ValueError("No trading dates in the cutoff range. Choose a different period.")
+
+    records = []
+    skipped = []
+    # Different seeds per cutoff make adjacent simulated forecasts independent
+    # conditional on historical estimates (realized test windows may overlap).
+    for window_id, cutoff in enumerate(cutoffs):
+        try:
+            bt = run_historical_backtest(
+                prices=prices,
+                cutoff_date=cutoff.date(),
+                lookback_years=lookback_years,
+                weights=weights,
+                initial_portfolio=initial_portfolio,
+                num_simulations=num_simulations,
+                horizon_days=horizon_days,
+                risk_free_rate=risk_free_rate,
+                seed=seed + window_id,
+            )
+        except ValueError as exc:
+            skipped.append({"cutoff_date": cutoff, "reason": str(exc)})
+            continue
+
+        s = bt["model"]["statistics"]
+        actual = bt["actual_ending_value"]
+        median = bt["predicted_median_ending_value"]
+        lower = s["fifth_percentile_ending_value"]
+        upper = s["ninety_fifth_percentile_ending_value"]
+        status = "Below 5th" if actual < lower else "Above 95th" if actual > upper else "Inside range"
+        predicted_return = median / initial_portfolio - 1.0
+        records.append(
+            {
+                "cutoff_date": cutoff,
+                "training_start": bt["training_start"],
+                "training_end": bt["training_end"],
+                "test_start": bt["test_dates"][0],
+                "test_end": bt["test_dates"][-1],
+                "training_observations": bt["training_observations"],
+                "predicted_p05": lower,
+                "predicted_median": median,
+                "predicted_p95": upper,
+                "actual_ending_value": actual,
+                "predicted_median_return": predicted_return,
+                "actual_total_return": bt["actual_total_return"],
+                "absolute_return_error_pct_points": abs(bt["actual_total_return"] - predicted_return) * 100,
+                "actual_percentile": bt["actual_percentile_of_simulations"],
+                "inside_90_interval": bool(bt["inside_90_percent_interval"]),
+                "outcome": status,
+            }
+        )
+
+    results = pd.DataFrame.from_records(records)
+    if results.empty:
+        raise ValueError(
+            "No completed test windows were available. Use earlier cutoffs, "
+            "a shorter forecast horizon, or stocks with a longer price history."
+        )
+    counts = results["outcome"].value_counts()
+    n = len(results)
+    return {
+        "windows": results,
+        "skipped": pd.DataFrame.from_records(skipped, columns=["cutoff_date", "reason"]),
+        "candidate_windows": len(cutoffs),
+        "completed_windows": n,
+        "coverage_rate": float(results["inside_90_interval"].mean()),
+        "below_rate": int(counts.get("Below 5th", 0)) / n,
+        "above_rate": int(counts.get("Above 95th", 0)) / n,
+        "median_absolute_return_error_pct_points": float(results["absolute_return_error_pct_points"].median()),
+    }
