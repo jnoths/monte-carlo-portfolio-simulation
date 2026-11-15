@@ -17,75 +17,84 @@ def cached_market_data(tickers: tuple[str, ...], lookback_years: int):
     return load_market_data(list(tickers), lookback_years)
 
 
+# Inputs are deliberately outside st.form. Changing a widget reruns the app,
+# so the simulation and charts below respond to the latest input values.
 with st.sidebar:
     st.header("Simulation settings")
-    with st.form("settings_form"):
-        ticker_text = st.text_input("Stock tickers (comma separated)", value="AAPL, MSFT, GOOG")
-        tickers = [t.strip().upper() for t in ticker_text.split(",") if t.strip()]
-        if 1 <= len(tickers) <= 6 and len(set(tickers)) == len(tickers):
-            st.caption("Set portfolio weights. They must add to 100%.")
-            equal_part = round(100.0 / len(tickers), 2)
-            weights_percent = []
-            for i, ticker in enumerate(tickers):
-                initial_weight = equal_part if i < len(tickers) - 1 else round(100 - equal_part * (len(tickers) - 1), 2)
-                weights_percent.append(
-                    st.number_input(
-                        f"{ticker} allocation (%)",
-                        min_value=0.0,
-                        max_value=100.0,
-                        value=float(initial_weight),
-                        step=1.0,
-                        key=f"allocation_{ticker}",
-                    )
+    st.caption("Charts recalculate automatically when you change a setting.")
+    ticker_text = st.text_input("Stock tickers (comma separated)", value="AAPL, MSFT, GOOG")
+    tickers = [t.strip().upper() for t in ticker_text.split(",") if t.strip()]
+    valid_tickers = 1 <= len(tickers) <= 6 and len(set(tickers)) == len(tickers)
+
+    weights_percent = []
+    if valid_tickers:
+        st.caption("Adjust relative allocations below. The app normalizes them to 100%.")
+        raw_allocations = []
+        for ticker in tickers:
+            raw_allocations.append(
+                st.slider(
+                    f"{ticker} allocation preference",
+                    min_value=0,
+                    max_value=100,
+                    value=50,
+                    step=1,
+                    key=f"relative_allocation_{ticker}",
                 )
-            st.caption(f"Total allocation: {sum(weights_percent):.2f}%")
+            )
+        allocation_sum = sum(raw_allocations)
+        if allocation_sum > 0:
+            weights_percent = [100.0 * x / allocation_sum for x in raw_allocations]
+            st.caption(
+                "Actual portfolio weights: "
+                + ", ".join(f"{t} {w:.1f}%" for t, w in zip(tickers, weights_percent))
+            )
         else:
-            weights_percent = []
-            st.warning("Please enter 1–6 different ticker symbols.")
-
-        initial_portfolio = st.number_input("Initial investment ($)", min_value=100.0, value=10000.0, step=500.0)
-        history_years = st.selectbox("Historical lookback (years)", [1, 3, 5], index=1)
-        forecast_years = st.selectbox("Forecast horizon (years)", [1, 2, 3], index=0)
-        num_simulations = st.selectbox("Number of simulations", [100, 500, 1000, 2500], index=2)
-        risk_free_percent = st.number_input("Annual risk-free rate (%)", min_value=0.0, max_value=25.0, value=4.0, step=0.5)
-        submitted = st.form_submit_button("Run simulation", type="primary")
-
-if submitted:
-    if not (1 <= len(tickers) <= 6) or len(set(tickers)) != len(tickers):
-        st.error("Enter 1–6 unique stock tickers.")
-    elif not np.isclose(sum(weights_percent), 100.0, atol=0.011):
-        st.error(f"Allocation weights must total 100%; currently {sum(weights_percent):.2f}%.")
+            st.warning("Move at least one allocation slider above zero.")
     else:
-        try:
-            with st.spinner("Loading historical data and simulating portfolios..."):
-                mean_returns, covariance, observations = cached_market_data(tuple(tickers), history_years)
-                result = run_simulation(
-                    mean_returns=mean_returns,
-                    covariance=covariance,
-                    weights=[w / 100 for w in weights_percent],
-                    initial_portfolio=initial_portfolio,
-                    num_simulations=num_simulations,
-                    num_days=forecast_years * 252,
-                    risk_free_rate=risk_free_percent / 100,
-                    seed=42,
-                )
-                st.session_state["latest_run"] = {
-                    "result": result,
-                    "tickers": tickers,
-                    "weights": weights_percent,
-                    "initial": initial_portfolio,
-                    "years": forecast_years,
-                    "sims": num_simulations,
-                    "observations": observations,
-                }
-        except (ValueError, KeyError, OSError, RuntimeError) as exc:
-            st.error(f"Could not run the simulation: {exc}")
+        st.warning("Please enter 1–6 different stock ticker symbols.")
 
-if "latest_run" not in st.session_state:
-    st.info("Set your portfolio options in the sidebar, then click **Run simulation**.")
+    initial_portfolio = st.number_input(
+        "Initial investment ($)", min_value=100.0, value=10000.0, step=500.0
+    )
+    history_years = st.selectbox("Historical lookback (years)", [1, 3, 5], index=1)
+    forecast_years = st.selectbox("Forecast horizon (years)", [1, 2, 3], index=0)
+    num_simulations = st.selectbox("Number of simulations", [100, 500, 1000, 2500], index=2)
+    risk_free_percent = st.number_input(
+        "Annual risk-free rate (%)", min_value=0.0, max_value=25.0, value=4.0, step=0.5
+    )
+
+if not valid_tickers or not weights_percent:
+    st.info("Enter valid tickers and nonzero allocations to display the graphs.")
     st.stop()
 
-run = st.session_state["latest_run"]
+try:
+    # Historical prices are cached for an hour, so changing only weights or
+    # investment size does not repeatedly call Yahoo Finance.
+    with st.spinner("Updating Monte Carlo simulation..."):
+        mean_returns, covariance, observations = cached_market_data(tuple(tickers), history_years)
+        result = run_simulation(
+            mean_returns=mean_returns,
+            covariance=covariance,
+            weights=[w / 100 for w in weights_percent],
+            initial_portfolio=initial_portfolio,
+            num_simulations=num_simulations,
+            num_days=forecast_years * 252,
+            risk_free_rate=risk_free_percent / 100,
+            seed=42,
+        )
+except (ValueError, KeyError, OSError, RuntimeError) as exc:
+    st.error(f"Could not update the simulation: {exc}")
+    st.stop()
+
+run = {
+    "result": result,
+    "tickers": tickers,
+    "weights": weights_percent,
+    "initial": initial_portfolio,
+    "years": forecast_years,
+    "sims": num_simulations,
+    "observations": observations,
+}
 result = run["result"]
 stats = result["statistics"]
 
